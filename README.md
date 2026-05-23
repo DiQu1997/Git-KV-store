@@ -20,13 +20,30 @@ You need a Git remote you can push to, and a local clone of it.
 
 ```bash
 git clone git@github.com:me/my-kv-store.git ~/kv
-gitkv ~/kv create-table pm
-gitkv ~/kv set -t pm user/alice "alice@example.com"
-gitkv ~/kv get -t pm user/alice
+
+# One-time setup: tell gitkv where the repo is and which table to default to
+gitkv config set repo ~/kv
+gitkv config set table pm
+
+# Daily use — no flags needed
+gitkv create-table pm
+gitkv set user/alice "alice@example.com"
+gitkv get user/alice
 # alice@example.com
-gitkv ~/kv list-tables
+gitkv list-tables
 # pm
 ```
+
+You can also override the defaults per command:
+
+```bash
+gitkv --repo /elsewhere set foo bar      # different repo, one-off
+gitkv set -t analytics event/42 click    # different table, one-off
+GITKV_REPO=/elsewhere gitkv list-tables  # via env var
+```
+
+See `gitkv config --help` (`config set`/`get`/`list`/`unset`/`path`) and
+`gitkv config list` to see which value comes from which source.
 
 As a Python library:
 
