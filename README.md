@@ -48,12 +48,33 @@ See `gitkv config --help` (`config set`/`get`/`list`/`unset`/`path`) and
 As a Python library:
 
 ```python
+import gitkv
+
+db = gitkv.open()                         # uses GITKV_REPO / config file
+# db = gitkv.open("/path/to/clone")       # or explicit
+
+db.create_table("pm")
+
+# Dict-style API (recommended)
+db["pm"]["user/alice/email"] = "alice@example.com"
+db["pm"]["user/alice/email"]              # → "alice@example.com"
+"user/alice/email" in db["pm"]            # → True
+del db["pm"]["user/alice/email"]
+
+"pm" in db                                # → True
+list(db)                                  # → ["pm"]
+len(db)                                   # → 1
+```
+
+The lower-level explicit API is still there and is the one to use when you
+want `.get()` to return `None` on a miss instead of raising `KeyError`:
+
+```python
 from gitkv import GitKVStore
 
-store = GitKVStore("/home/me/kv")
-store.create_table("pm")
+store = GitKVStore("/path/to/clone")
 store.table("pm").set("user/alice", "alice@example.com")
-store.table("pm").get("user/alice")
+store.table("pm").get("missing")          # → None (does not raise)
 ```
 
 ## How the data is laid out
