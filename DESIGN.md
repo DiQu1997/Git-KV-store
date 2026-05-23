@@ -22,43 +22,52 @@ Every write builds on Git's atomic ref update as a compare-and-swap (CAS) primit
 
 ### Write path
 
-```
-1. Acquire a process-level file lock (e.g. flock on .git/kv.lock)
-   — protects the shared working tree, index, and HEAD against
-   concurrent in-process operations.
+Writes are constructed entirely with Git plumbing — `hash-object`, `mktree`, `commit-tree`, `push`. The working tree, index, and `HEAD` are never touched.
 
-2. Cheap probe: fetch the current active branch's tip commit only.
+```
+1. Acquire a per-table file lock (flock on .git/kv-locks/<prefix>.lock)
+   — serializes concurrent in-process operations against the same table.
+
+2. Cheap probe: fetch only the current active branch's tip commit.
        git fetch --filter=tree:0 --depth=1 origin <active>
-   — ~1 KB regardless of how far behind the client is.
+   ~1 KB regardless of how far behind the client is.
 
 3. Inspect the tip commit's message:
-     - If it carries a Tombstone-Next-Branch trailer:
-         follow the chain (see "Discovery" below) to find the new
-         active branch, then restart step 2 with that branch.
-     - Otherwise: this is the live branch. Proceed to step 4.
+     - Tombstone-Next-Branch trailer present → walk the chain (see
+       "Discovery") to the new active branch, then restart step 2.
+     - Otherwise → this is the live branch. Proceed to step 4.
 
-4. Full fetch of the now-known active branch.
+4. Fetch the active branch's tree (but not its blobs):
+       git fetch --filter=blob:none --depth=1 origin <active>
+   We need ls-tree on the existing tree to know which entries to keep,
+   but we never need to read existing values during a write.
 
-5. Create a transaction branch from the active branch tip,
-   apply the write on it, commit it.
+5. Construct the new commit object in pure plumbing:
+     - new_blob_sha = git hash-object -w --stdin   (for set)
+     - new_tree_sha = git mktree --missing         (rebuild the tree
+       with the modified entry; --missing allows referencing blob
+       shas the remote already has but we do not)
+     - new_commit_sha = git commit-tree <new_tree_sha> -p <tip>
+       (message includes the Commit-Number trailer described below)
 
-6. Push the txn branch's tip into the active branch's ref,
-   fast-forward only:
-       git push origin <txn_sha>:refs/heads/<active>
-   - Success → write committed.
-   - Rejected (non-FF)  → goto step 2 (someone else pushed first
-     or rotation happened). Retry with the latest state.
+6. Push the new commit into the active branch's ref, fast-forward only:
+       git push origin <new_commit_sha>:refs/heads/<active>
+   - Success → write committed. Update the local cache with
+     (active_branch, new_commit_sha).
+   - Rejected (non-FF) → another writer pushed first or rotation
+     happened. Invalidate the cache, back off with jitter, restart
+     from step 2.
 
 7. Release the lock.
 ```
 
-The transaction-branch indirection isolates the write's commit from the active branch until the moment of the CAS push. Failure leaves no trace — the txn branch is local-only and can be discarded.
+Plumbing throughout means the only mutable state touched per operation is the per-table cache and Git's object database (which is safe for concurrent writes by design). No checkout, no working-tree shuffling, no temporary directory.
 
-The `reset --hard HEAD^` pattern in the current implementation is removed entirely. It is incorrect under concurrent writes (can silently drop other un-pushed commits and wipes the working tree) and unnecessary once the txn-branch + ff-only CAS pattern is in place.
+The `reset --hard HEAD^` pattern in the original implementation is removed entirely. It is incorrect under concurrent writes (can silently drop other un-pushed commits and wipes the working tree) and unnecessary once the ff-only CAS pattern is in place.
 
 ### Read path
 
-Same cheap-probe-first pattern: confirm the cached active branch is still active (not a tombstone), then fetch enough of it to read the requested key. With `--filter=blob:none`, individual key reads can lazy-fetch only the blob they need.
+Same cheap-probe-first pattern: confirm the cached active branch is still active (not a tombstone) via `--filter=tree:0 --depth=1`, then fetch the active branch (full fetch in the current implementation) and read the requested key with `git cat-file -p <tip_tree>:<key>`. A future optimisation can switch to `--filter=blob:none` plus lazy-fetched individual blobs.
 
 ## Multi-tenancy: tables via ref prefixes
 
@@ -129,6 +138,20 @@ Field semantics:
 | `Tombstone-Created-At` | optional | Diagnostics only. |
 
 A `Tombstone-Generation` field (monotonic counter) was discussed but is **not** part of the protocol. Cycle and replay protection rely instead on a visited-set during chain traversal — sufficient for the current trust model.
+
+### `Commit-Number` trailer on every commit
+
+Every commit that this protocol writes — the "Open log segment" commit at the start of a new log branch, every write commit, and every tombstone — carries a `Commit-Number: N` trailer in its message:
+
+```
+Set key: foo
+
+Commit-Number: 17
+```
+
+`N` is the parent commit's `Commit-Number` plus one. The first commit on each new log branch starts at `Commit-Number: 1`; subsequent writes count up within the segment. Rotation does not reset the counter on the closing branch (the tombstone is just `parent_number + 1`), but the new branch begins a fresh count from 1.
+
+The trailer makes commit count locally observable from the tip commit alone, which is essential because clients never fetch full branch history. Auto-rotation reads the tip's `Commit-Number` after each successful write (with no extra fetch — we already have the commit object we just pushed) and triggers rotation when it meets the threshold.
 
 ### Why message-driven, not name-driven
 
@@ -287,8 +310,9 @@ Add the multi-table structure, tombstone protocol, and auto-rotation described a
 
 - `main` / `<prefix>_main` / `<prefix>_log_<uuid>` three-tier ref layout.
 - Cheap-probe + chain-walk discovery on the client.
-- Auto rotation triggered at the default 10000-commit threshold.
+- Auto rotation triggered at the default 10000-commit threshold (using the `Commit-Number` trailer on the active branch's tip).
 - `commit-tree`-based rotation with no working-tree involvement.
 - UUID branch naming.
+- All operations — reads, writes, and rotation — use Git plumbing exclusively; the working tree is never touched. The Stage 1 `GitKVFileBasedSync` class is replaced by the `GitKVStore` / `GitKVTable` pair.
 
 After Stage 2 the store supports multi-table, automatically-bounded history.
