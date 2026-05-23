@@ -445,7 +445,9 @@ class GitKVStore:
         genesis_sha = self._commit_tree(empty_tree, [], genesis_msg)
 
         first_log_sha = self._commit_tree(
-            empty_tree, [genesis_sha], f"Open log segment for {prefix}"
+            empty_tree,
+            [genesis_sha],
+            f"Open log segment for {prefix}\n\nCommit-Number: 1\n",
         )
 
         rc, _, err = self._git_safe(
