@@ -3,7 +3,8 @@ boundary so we never have to guard against bad data deeper in the plumbing."""
 
 import pytest
 
-from Git_KV import GitKVError, _validate_key, _validate_prefix
+from gitkv import GitKVError
+from gitkv._store import _validate_key, _validate_prefix
 
 
 class TestValidatePrefix:

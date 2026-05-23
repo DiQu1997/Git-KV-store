@@ -10,17 +10,17 @@ import sys
 
 import pytest
 
-from Git_KV import GitKVStore
+from gitkv import GitKVStore
 
 
 # Worker entrypoints (must be importable / picklable) -----------------------
 
 def _worker_write_keys(repo_path, prefix, items, rotation_threshold):
     """Worker process: writes a list of (key, value) pairs on `prefix`."""
-    # Ensure the worker can import Git_KV when launched fresh.
-    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-    from Git_KV import GitKVStore  # re-import inside the worker
+    # The worker process inherits the parent's sys.path when fork is the
+    # start method (default on Linux), so `gitkv` is importable without
+    # any path patching.
+    from gitkv import GitKVStore  # re-import inside the worker
     s = GitKVStore(repo_path, rotation_threshold=rotation_threshold)
     t = s.table(prefix)
     for key, value in items:

@@ -1,21 +1,14 @@
-"""End-to-end CLI tests: drive main.py with subprocess and check stdout / exit
-codes for each subcommand."""
+"""End-to-end CLI tests: invoke `python -m gitkv` as a subprocess and check
+stdout / exit codes for each subcommand."""
 
-import os
 import subprocess
 import sys
 
-import pytest
-
-
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-MAIN_PY = os.path.join(REPO_ROOT, "main.py")
-
 
 def run_cli(*args, expect_exit=0):
-    """Run `python3 main.py <args>` and return (stdout, stderr)."""
+    """Run `python -m gitkv <args>` and return (stdout, stderr)."""
     proc = subprocess.run(
-        [sys.executable, MAIN_PY, *args],
+        [sys.executable, "-m", "gitkv", *args],
         capture_output=True,
         text=True,
     )

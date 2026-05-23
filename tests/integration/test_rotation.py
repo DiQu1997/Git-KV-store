@@ -3,7 +3,8 @@ preservation across rotations, commit-number bookkeeping."""
 
 import pytest
 
-from Git_KV import GitKVStore, TOMBSTONE_VERSION, _parse_trailer
+from gitkv import GitKVStore
+from gitkv._store import TOMBSTONE_VERSION, _parse_trailer
 
 
 @pytest.fixture

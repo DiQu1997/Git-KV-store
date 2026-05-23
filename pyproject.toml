@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gitkv"
+version = "0.1.0"
+description = "Git-backed key-value store with multi-table layout and tombstone-based log rotation"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Di Qu" }]
+keywords = ["git", "key-value", "kv", "storage", "database"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Database",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+gitkv = "gitkv._cli:main"
+
+[project.urls]
+Repository = "https://github.com/DiQu1997/Git-KV-store"
+Issues = "https://github.com/DiQu1997/Git-KV-store/issues"
+
+[tool.setuptools.packages.find]
+include = ["gitkv*"]
+exclude = ["tests*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Fall back to the source tree if the package isn't installed (lets a fresh
+# `git clone && pytest` work without first running `pip install -e .`).
+pythonpath = ["."]
+addopts = "-ra --strict-markers"
+markers = [
+    "slow: tests that take more than a couple of seconds (concurrency, rotation thresholds)",
+]

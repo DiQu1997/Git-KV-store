@@ -3,7 +3,7 @@ cross-clone visibility."""
 
 import pytest
 
-from Git_KV import GitKVError, GitKVStore
+from gitkv import GitKVError, GitKVStore
 
 
 @pytest.fixture
