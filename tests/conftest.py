@@ -10,7 +10,7 @@ import subprocess
 
 import pytest
 
-from Git_KV import GitKVStore
+from gitkv import GitKVStore
 
 
 def _run(cmd, cwd=None):

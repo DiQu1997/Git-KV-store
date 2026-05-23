@@ -1,6 +1,6 @@
 """Multi-table isolation: tables share a repo but never interact."""
 
-from Git_KV import GitKVStore
+from gitkv import GitKVStore
 
 
 def test_same_key_in_two_tables_is_independent(store):

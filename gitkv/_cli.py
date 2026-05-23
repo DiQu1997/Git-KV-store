@@ -1,7 +1,7 @@
 import argparse
 import sys
 
-from Git_KV import (
+from gitkv import (
     DEFAULT_ROTATION_THRESHOLD,
     GitKVError,
     GitKVStore,

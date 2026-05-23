@@ -2,13 +2,13 @@
 
 import pytest
 
-from Git_KV import (
+from gitkv import (
     GitKVError,
     GitKVStore,
     TableAlreadyExistsError,
     TableNotFoundError,
-    _parse_trailer,
 )
+from gitkv._store import _parse_trailer
 
 
 class TestCreateTable:

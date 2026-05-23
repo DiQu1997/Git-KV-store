@@ -8,7 +8,7 @@ exhaustive coverage of them.
 
 import pytest
 
-from Git_KV import _is_non_ff, _parse_trailer, _ref_to_branch
+from gitkv._store import _is_non_ff, _parse_trailer, _ref_to_branch
 
 
 class TestParseTrailer:
