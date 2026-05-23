@@ -497,6 +497,30 @@ class GitKVStore:
         _validate_prefix(prefix)
         return GitKVTable(self, prefix)
 
+    # ----- dict-style ergonomics -----
+    #
+    # These wrap the explicit methods so callers can write idiomatic Python:
+    #
+    #     store["pm"]                  # → GitKVTable
+    #     "pm" in store                # → bool
+    #     list(store)                  # → ["pm", "analytics", ...]
+    #
+    # No existence check on __getitem__ — it would cost an extra fetch on
+    # every access and operations on the returned table already surface
+    # TableNotFoundError. Use `prefix in store` to check explicitly.
+
+    def __getitem__(self, prefix):
+        return self.table(prefix)
+
+    def __contains__(self, prefix):
+        return prefix in self.list_tables()
+
+    def __iter__(self):
+        return iter(self.list_tables())
+
+    def __len__(self):
+        return len(self.list_tables())
+
 
 # ---------------------------------------------------------------------------
 # GitKVTable — one namespace
@@ -716,3 +740,26 @@ class GitKVTable:
                 continue
             raise GitKVError(f"Tombstone push failed: {err.strip()}")
         raise GitKVError(f"Rotation failed after {max_attempts} attempts: {last_err}")
+
+    # ----- dict-style ergonomics -----
+    #
+    # __getitem__ raises KeyError (not None) on a missing key, matching dict
+    # semantics. The explicit `.get(key)` still returns None — callers who
+    # want the "missing means None" behaviour keep using that.
+
+    def __getitem__(self, key):
+        value = self.get(key)
+        if value is None:
+            raise KeyError(key)
+        return value
+
+    def __setitem__(self, key, value):
+        self.set(key, value)
+
+    def __delitem__(self, key):
+        if self.get(key) is None:
+            raise KeyError(key)
+        self.delete(key)
+
+    def __contains__(self, key):
+        return self.get(key) is not None
