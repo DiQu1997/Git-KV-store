@@ -1,65 +1,204 @@
+"""Command-line interface for gitkv.
+
+Daily commands resolve their repo path and (where applicable) table name from
+this cascade — see `gitkv config --help` for details:
+
+    1. CLI flag (`--repo`, `--table`)
+    2. Env var (`GITKV_REPO`, `GITKV_TABLE`)
+    3. Config file (`~/.config/gitkv/config.ini`)
+
+So after `gitkv config set repo ~/kv` + `gitkv config set table pm`, daily
+use is just `gitkv set foo bar` / `gitkv get foo`.
+"""
+
 import argparse
 import sys
 
 from gitkv import (
-    DEFAULT_ROTATION_THRESHOLD,
     GitKVError,
     GitKVStore,
     TableAlreadyExistsError,
     TableNotFoundError,
 )
+from gitkv._config import (
+    ALLOWED_KEYS,
+    Config,
+    config_path,
+    describe_sources,
+    resolve_repo,
+    resolve_rotation_threshold,
+    resolve_table,
+    write_config,
+)
+
+
+def _add_repo_flag(p):
+    p.add_argument(
+        "--repo",
+        help="Repo path (overrides GITKV_REPO env var and config file)",
+    )
+    p.add_argument(
+        "--rotation-threshold",
+        type=int,
+        default=None,
+        help="Commit-count threshold for auto-rotation",
+    )
+
+
+def _add_table_flag(p):
+    p.add_argument(
+        "-t", "--table",
+        help="Table name (overrides GITKV_TABLE env var and config file)",
+    )
 
 
 def build_parser():
     parser = argparse.ArgumentParser(
+        prog="gitkv",
         description=(
-            "Git-backed key-value store. Subcommands operate on tables; "
-            "get/set/delete take a --table (-t) flag selecting the namespace."
+            "Git-backed key-value store. Configure a default repo and table "
+            "via `gitkv config set ...` so daily commands don't need flags."
         ),
     )
-    parser.add_argument("repo_path", help="Path to the Git repository")
-    parser.add_argument(
-        "--rotation-threshold",
-        type=int,
-        default=DEFAULT_ROTATION_THRESHOLD,
-        help=f"Commit-count threshold for auto-rotation (default: {DEFAULT_ROTATION_THRESHOLD})",
-    )
-
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p_get = sub.add_parser("get", help="Read a key")
-    p_get.add_argument("-t", "--table", required=True)
-    p_get.add_argument("key")
+    # Data commands -------------------------------------------------------
+    for name, help_text, extras in [
+        ("get", "Read a key", [("key", {})]),
+        ("set", "Write a key", [("key", {}), ("value", {})]),
+        ("delete", "Delete a key", [("key", {})]),
+        ("rotate", "Force rotation of the table's log", []),
+    ]:
+        p = sub.add_parser(name, help=help_text)
+        _add_repo_flag(p)
+        _add_table_flag(p)
+        for arg_name, kwargs in extras:
+            p.add_argument(arg_name, **kwargs)
 
-    p_set = sub.add_parser("set", help="Write a key")
-    p_set.add_argument("-t", "--table", required=True)
-    p_set.add_argument("key")
-    p_set.add_argument("value")
-
-    p_del = sub.add_parser("delete", help="Delete a key")
-    p_del.add_argument("-t", "--table", required=True)
-    p_del.add_argument("key")
-
+    # Table-management commands ------------------------------------------
     p_create = sub.add_parser("create-table", help="Create a new table")
-    p_create.add_argument("table")
+    _add_repo_flag(p_create)
+    p_create.add_argument("table", help="Prefix / name of the new table")
 
-    sub.add_parser("list-tables", help="List known tables")
+    p_list = sub.add_parser("list-tables", help="List known tables")
+    _add_repo_flag(p_list)
 
-    p_rot = sub.add_parser("rotate", help="Force rotation of a table's log")
-    p_rot.add_argument("-t", "--table", required=True)
+    # Config command ------------------------------------------------------
+    p_config = sub.add_parser("config", help="Manage user defaults")
+    config_sub = p_config.add_subparsers(dest="config_cmd", required=True)
+
+    config_sub.add_parser("list", help="Show effective config and its source")
+    config_sub.add_parser("path", help="Print the config file path")
+
+    p_cfg_get = config_sub.add_parser("get", help="Print one config value")
+    p_cfg_get.add_argument("key", choices=sorted(ALLOWED_KEYS))
+
+    p_cfg_set = config_sub.add_parser("set", help="Set one config value")
+    p_cfg_set.add_argument("key", choices=sorted(ALLOWED_KEYS))
+    p_cfg_set.add_argument("value")
+
+    p_cfg_unset = config_sub.add_parser("unset", help="Remove one config value")
+    p_cfg_unset.add_argument("key", choices=sorted(ALLOWED_KEYS))
 
     return parser
 
+
+# ---------------------------------------------------------------------------
+# Resolution helpers — small wrappers that turn unset values into clear errors
+# ---------------------------------------------------------------------------
+
+def _require_repo(args, cfg):
+    repo = resolve_repo(getattr(args, "repo", None), cfg)
+    if not repo:
+        raise GitKVError(
+            "No repo configured. Set one with `gitkv config set repo PATH`, "
+            "export GITKV_REPO=..., or pass --repo."
+        )
+    return repo
+
+
+def _require_table(args, cfg):
+    table = resolve_table(getattr(args, "table", None), cfg)
+    if not table:
+        raise GitKVError(
+            "No table configured. Set one with `gitkv config set table NAME`, "
+            "export GITKV_TABLE=..., or pass --table / -t."
+        )
+    return table
+
+
+# ---------------------------------------------------------------------------
+# Command handlers
+# ---------------------------------------------------------------------------
+
+def _handle_data_command(args, cfg, store):
+    table_name = _require_table(args, cfg)
+    table = store.table(table_name)
+    if args.cmd == "get":
+        value = table.get(args.key)
+        if value is None:
+            print(f"Key '{args.key}' not found.")
+        else:
+            print(value)
+    elif args.cmd == "set":
+        table.set(args.key, args.value)
+    elif args.cmd == "delete":
+        table.delete(args.key)
+    elif args.cmd == "rotate":
+        new_branch = table.rotate()
+        print(f"Rotated. New active log: {new_branch}")
+
+
+def _handle_config_command(args):
+    if args.config_cmd == "path":
+        print(config_path())
+        return
+    if args.config_cmd == "list":
+        for key, value, source in describe_sources(Config.from_file()):
+            shown = value if value is not None else "(unset)"
+            print(f"{key} = {shown}    [{source}]")
+        return
+    if args.config_cmd == "get":
+        cfg = Config.from_file()
+        value = getattr(cfg, args.key)
+        if value is None:
+            sys.exit(1)
+        print(value)
+        return
+    if args.config_cmd == "set":
+        path = write_config({args.key: args.value})
+        print(f"Set {args.key} = {args.value} in {path}")
+        return
+    if args.config_cmd == "unset":
+        path = write_config({args.key: None})
+        print(f"Unset {args.key} in {path}")
+        return
+
+
+# ---------------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------------
 
 def main():
     parser = build_parser()
     args = parser.parse_args()
 
+    if args.cmd == "config":
+        try:
+            _handle_config_command(args)
+        except (ValueError, OSError) as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        return
+
+    cfg = Config.from_file()
+
     try:
-        store = GitKVStore(
-            args.repo_path,
-            rotation_threshold=args.rotation_threshold,
+        repo = _require_repo(args, cfg)
+        rotation_threshold = resolve_rotation_threshold(
+            getattr(args, "rotation_threshold", None), cfg
         )
+        store = GitKVStore(repo, rotation_threshold=rotation_threshold)
     except GitKVError as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
@@ -75,24 +214,7 @@ def main():
             print(f"Created table: {args.table}")
             return
 
-        if args.cmd == "rotate":
-            new_branch = store.table(args.table).rotate()
-            print(f"Rotated. New active log: {new_branch}")
-            return
-
-        table = store.table(args.table)
-        if args.cmd == "get":
-            value = table.get(args.key)
-            if value is None:
-                print(f"Key '{args.key}' not found.")
-            else:
-                print(value)
-        elif args.cmd == "set":
-            table.set(args.key, args.value)
-        elif args.cmd == "delete":
-            table.delete(args.key)
-        else:
-            parser.error(f"Unknown command: {args.cmd}")
+        _handle_data_command(args, cfg, store)
     except TableNotFoundError as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(2)
