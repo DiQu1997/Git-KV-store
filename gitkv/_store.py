@@ -133,6 +133,49 @@ def _validate_key(key):
     return parts
 
 
+def _normalize_path_prefix(prefix):
+    """Normalize a list_keys/list_items prefix to canonical form.
+
+    Empty / None / "/" all mean "no restriction". Backslashes are folded to
+    forward slashes for parity with `_validate_key`. Returns the trimmed
+    prefix or "" for the root.
+    """
+    if prefix is None or prefix == "":
+        return ""
+    if not isinstance(prefix, str):
+        raise GitKVError(f"Invalid prefix (must be string): {prefix!r}")
+    normalized = prefix.replace("\\", "/")
+    # Allow a lone "/" (= root, equivalent to "") but reject any other
+    # leading-slash form, matching `_validate_key`'s rejection of absolute keys.
+    if normalized == "/":
+        return ""
+    if normalized.startswith("/"):
+        raise GitKVError(f"Invalid prefix (must be relative): {prefix!r}")
+    trimmed = normalized.rstrip("/")
+    if not trimmed:
+        return ""
+    parts = trimmed.split("/")
+    if any(seg in ("", ".", "..") for seg in parts):
+        raise GitKVError(f"Invalid prefix (empty or '.'/'..' segment): {prefix!r}")
+    if parts[0] == ".git":
+        raise GitKVError(f"Invalid prefix (refers to .git): {prefix!r}")
+    return trimmed
+
+
+def _apply_pagination(keys, after, limit):
+    """Drop everything <= `after`, then take the first `limit`."""
+    if after is not None:
+        if not isinstance(after, str):
+            raise GitKVError(f"`after` must be a string, got {type(after).__name__}")
+        from bisect import bisect_right
+        keys = keys[bisect_right(keys, after):]
+    if limit is not None:
+        if not isinstance(limit, int) or limit < 0:
+            raise GitKVError(f"`limit` must be a non-negative int, got {limit!r}")
+        keys = keys[:limit]
+    return keys
+
+
 # ---------------------------------------------------------------------------
 # GitKVStore — top-level handle
 # ---------------------------------------------------------------------------
@@ -763,3 +806,82 @@ class GitKVTable:
 
     def __contains__(self, key):
         return self.get(key) is not None
+
+    def __iter__(self):
+        return iter(self.list_keys())
+
+    # ----- listing -----
+
+    def list_keys(self, prefix="", limit=None, after=None):
+        """Lexicographically sorted keys, optionally restricted to a path prefix.
+
+        `prefix` is matched as a path: `"user/"` and `"user"` both restrict to
+        keys whose first segment is exactly `user`. A prefix that resolves to a
+        single blob (a key itself) returns that one key.
+
+        Pagination is key-cursor style: pass the last returned key as `after`
+        on the next call. Caller stops when `len(result) < limit`. Results
+        across pages are best-effort if the table is being written concurrently.
+
+        Reads tree objects only — no blob contents are fetched.
+        """
+        normalized = _normalize_path_prefix(prefix)
+        with self.store._lock(self.prefix):
+            active, _ = self._find_active()
+            self.store._fetch_tree_only(active)
+            tip = self.store._rev_parse(self.store._remote_ref(active))
+            keys = self._collect_keys_under(tip, normalized)
+        return _apply_pagination(keys, after, limit)
+
+    def list_items(self, prefix="", limit=None, after=None):
+        """Same as `list_keys`, but each entry is a `(key, value)` tuple.
+
+        Triggers a one-time full fetch of the active branch's tip (blobs
+        included), then reads each blob in the result page.
+        """
+        normalized = _normalize_path_prefix(prefix)
+        with self.store._lock(self.prefix):
+            active, _ = self._find_active()
+            self.store._fetch_full(active)
+            tip = self.store._rev_parse(self.store._remote_ref(active))
+            keys = self._collect_keys_under(tip, normalized)
+            page = _apply_pagination(keys, after, limit)
+            return [(k, self._cat_blob(tip, k)) for k in page]
+
+    # ----- listing helpers -----
+
+    def _collect_keys_under(self, tip, normalized_prefix):
+        """Return sorted keys at or under the given path. `normalized_prefix`
+        has no leading/trailing slashes and is either empty (root) or a
+        validated path."""
+        if not normalized_prefix:
+            rc, out, _ = self.store._git_safe(
+                "ls-tree", "-r", "--name-only", tip
+            )
+            if rc != 0:
+                return []
+            return sorted(n for n in out.decode().splitlines() if n)
+
+        path_ref = f"{tip}:{normalized_prefix}"
+        rc, out, _ = self.store._git_safe("cat-file", "-t", path_ref)
+        if rc != 0:
+            return []
+        obj_type = out.decode().strip()
+        if obj_type == "blob":
+            return [normalized_prefix]
+        if obj_type != "tree":
+            return []
+
+        rc, out, _ = self.store._git_safe(
+            "ls-tree", "-r", "--name-only", path_ref
+        )
+        if rc != 0:
+            return []
+        names = (n for n in out.decode().splitlines() if n)
+        return sorted(f"{normalized_prefix}/{n}" for n in names)
+
+    def _cat_blob(self, tip, key):
+        rc, out, _ = self.store._git_safe("cat-file", "-p", f"{tip}:{key}")
+        if rc != 0:
+            raise GitKVError(f"Failed to read blob for key {key!r}")
+        return out.decode()

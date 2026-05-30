@@ -66,6 +66,23 @@ list(db)                                  # → ["pm"]
 len(db)                                   # → 1
 ```
 
+Listing keys and items, with path-prefix filter and pagination:
+
+```python
+table = db["pm"]
+
+table.list_keys()                         # every key, sorted
+table.list_keys(prefix="user/")           # only keys under user/
+table.list_keys(prefix="user/alice")      # only user/alice/*
+table.list_keys(limit=100)                # first 100
+table.list_keys(limit=100, after=last)    # next page
+
+table.list_items(prefix="user/alice")     # [(key, value), ...]
+list(table)                               # same as table.list_keys()
+```
+
+Prefix matching is segment-strict — `prefix="user"` does **not** match `users/...`. Trailing slash is optional.
+
 The lower-level explicit API is still there and is the one to use when you
 want `.get()` to return `None` on a miss instead of raising `KeyError`:
 
