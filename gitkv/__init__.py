@@ -26,20 +26,27 @@ from gitkv._store import (
     GitKVError,
     GitKVStore,
     GitKVTable,
+    SyncDivergedError,
     TableAlreadyExistsError,
     TableNotFoundError,
 )
 
 
-def open(repo_path=None, *, rotation_threshold=None):
-    """Open a `GitKVStore`, resolving the repo path via the same cascade the
-    CLI uses (explicit arg → GITKV_REPO env var → config file).
+def open(repo_path=None, *, rotation_threshold=None, offline=None):
+    """Open a `GitKVStore`, resolving the repo path and mode via the same
+    cascade the CLI uses (explicit arg → env var → config file).
+
+    offline=True gives a store whose every op is local-only; exchange with
+    the remote happens through store.pull() / store.push() / store.sync().
+    offline=None (default) resolves GITKV_MODE / the config `mode` key,
+    falling back to online.
 
     Raises `GitKVError` if no repo path can be resolved.
     """
     # Local imports keep `import gitkv` cheap when callers don't need config.
     from gitkv._config import (
         Config,
+        resolve_mode,
         resolve_repo,
         resolve_rotation_threshold,
     )
@@ -51,7 +58,15 @@ def open(repo_path=None, *, rotation_threshold=None):
             "or run `gitkv config set repo PATH`."
         )
     threshold = resolve_rotation_threshold(rotation_threshold, cfg)
-    return GitKVStore(resolved, rotation_threshold=threshold)
+    if offline is None:
+        mode = resolve_mode(None, cfg)
+    else:
+        mode = "offline" if offline else "online"
+    return GitKVStore(
+        resolved,
+        rotation_threshold=threshold,
+        offline=(mode == "offline"),
+    )
 
 
 __all__ = [
@@ -62,9 +77,10 @@ __all__ = [
     "GitKVError",
     "GitKVStore",
     "GitKVTable",
+    "SyncDivergedError",
     "TableAlreadyExistsError",
     "TableNotFoundError",
     "open",
 ]
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"

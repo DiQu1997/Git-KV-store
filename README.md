@@ -30,8 +30,10 @@ gitkv create-table pm
 gitkv set user/alice "alice@example.com"
 gitkv get user/alice
 # alice@example.com
+gitkv delete user/alice
 gitkv list-tables
 # pm
+gitkv rotate                             # manually close the current log segment
 ```
 
 You can also override the defaults per command:
@@ -44,6 +46,12 @@ GITKV_REPO=/elsewhere gitkv list-tables  # via env var
 
 See `gitkv config --help` (`config set`/`get`/`list`/`unset`/`path`) and
 `gitkv config list` to see which value comes from which source.
+
+Config keys: `repo`, `table`, `mode` (`online`/`offline`), and
+`rotation_threshold` (commits per log segment before auto-rotation,
+default 10000). Each has a matching env var: `GITKV_REPO`, `GITKV_TABLE`,
+`GITKV_MODE`, `GITKV_ROTATION_THRESHOLD`. Resolution is always
+CLI flag > env var > config file > default.
 
 As a Python library:
 
@@ -93,6 +101,48 @@ store = GitKVStore("/path/to/clone")
 store.table("pm").set("user/alice", "alice@example.com")
 store.table("pm").get("missing")          # → None (does not raise)
 ```
+
+## Offline mode
+
+By default every op syncs with the remote (fetch before read, push after
+write) so multiple clients stay consistent. If you're the only writer — or
+you're on a plane — offline mode keeps every op local and you sync when you
+choose:
+
+```bash
+gitkv config set mode offline    # or: --mode offline / GITKV_MODE=offline
+
+gitkv set foo bar                # instant, no network
+gitkv status                     # per-branch ahead/behind vs the remote
+gitkv push                       # publish local work
+gitkv pull                       # fast-forward local branches
+gitkv sync                       # pull then push
+```
+
+```python
+db = gitkv.open(offline=True)
+db["pm"]["k"] = "v"              # local commit only
+db.sync()                        # exchange with the remote
+```
+
+gitkv never auto-merges. If a branch moved both locally and on the remote,
+`pull`/`push` refuse with `SyncDivergedError` (CLI exit code 4) and leave
+everything untouched — reconcile with plain git, then retry. Offline mode is
+therefore effectively **single-writer**; concurrent writers should stay in
+online mode, where Git's fast-forward push gives compare-and-swap safety.
+
+### Choosing a mode
+
+| Scenario | Mode |
+|---|---|
+| Multiple machines / writers sharing state | online (default) |
+| Personal store, one machine at a time | offline + occasional `sync` |
+| Bulk-loading many keys, publish once | offline, then one `push` |
+| No network (plane, air-gapped) | offline |
+
+Online costs one or more network round-trips per operation; offline
+operations are local commits (roughly 3x faster even against a same-disk
+remote, far more over a real network).
 
 ## How the data is laid out
 

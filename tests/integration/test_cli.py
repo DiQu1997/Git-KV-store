@@ -12,14 +12,14 @@ import sys
 
 import pytest
 
-from gitkv._config import ENV_CONFIG, ENV_REPO, ENV_TABLE
+from gitkv._config import ENV_CONFIG, ENV_MODE, ENV_REPO, ENV_TABLE
 
 
 def run_cli(*args, env_overrides=None, expect_exit=0):
     """Run `python -m gitkv <args>` with a clean GITKV_* env, applying any
     overrides, and return (stdout, stderr)."""
     env = os.environ.copy()
-    for var in (ENV_REPO, ENV_TABLE, ENV_CONFIG):
+    for var in (ENV_REPO, ENV_TABLE, ENV_CONFIG, ENV_MODE):
         env.pop(var, None)
     if env_overrides:
         env.update(env_overrides)
@@ -209,3 +209,101 @@ class TestErrors:
         }
         _, err = run_cli("list-tables", env_overrides=env, expect_exit=1)
         assert "Not a git repository" in err
+
+
+# ---------------------------------------------------------------------------
+# Offline mode + sync commands
+# ---------------------------------------------------------------------------
+
+def _break_remote(clone):
+    subprocess.run(
+        ["git", "-C", str(clone), "remote", "set-url", "origin",
+         "/nonexistent/gitkv-blackhole.git"],
+        check=True, capture_output=True,
+    )
+
+
+class TestOfflineCli:
+    def test_mode_flag_works_without_network(self, clone, tmp_path):
+        _break_remote(clone)
+        env = {ENV_REPO: str(clone), ENV_CONFIG: str(tmp_path / "config.ini")}
+        run_cli("create-table", "pm", "--mode", "offline", env_overrides=env)
+        run_cli("set", "-t", "pm", "foo", "bar", "--mode", "offline",
+                env_overrides=env)
+        out, _ = run_cli("get", "-t", "pm", "foo", "--mode", "offline",
+                         env_overrides=env)
+        assert out.strip() == "bar"
+
+    def test_mode_env_var(self, clone, tmp_path):
+        _break_remote(clone)
+        env = {
+            ENV_REPO: str(clone),
+            ENV_CONFIG: str(tmp_path / "config.ini"),
+            ENV_MODE: "offline",
+        }
+        run_cli("create-table", "pm", env_overrides=env)
+        out, _ = run_cli("list-tables", env_overrides=env)
+        assert out.strip() == "pm"
+
+    def test_mode_via_config_file(self, clone, tmp_path):
+        _break_remote(clone)
+        env = {ENV_REPO: str(clone), ENV_CONFIG: str(tmp_path / "config.ini")}
+        run_cli("config", "set", "mode", "offline", env_overrides=env)
+        run_cli("create-table", "pm", env_overrides=env)
+        out, _ = run_cli("list-tables", env_overrides=env)
+        assert out.strip() == "pm"
+
+    def test_config_rejects_invalid_mode(self, tmp_path):
+        env = {ENV_CONFIG: str(tmp_path / "config.ini")}
+        _, err = run_cli("config", "set", "mode", "sometimes",
+                         env_overrides=env, expect_exit=1)
+        assert "Invalid mode" in err
+
+
+class TestSyncCli:
+    def test_status_in_sync(self, clone, tmp_path):
+        env = {ENV_REPO: str(clone), ENV_CONFIG: str(tmp_path / "config.ini")}
+        out, _ = run_cli("status", env_overrides=env)
+        assert "In sync" in out
+
+    def test_offline_write_then_status_push_status(self, clone, tmp_path):
+        env = {
+            ENV_REPO: str(clone),
+            ENV_CONFIG: str(tmp_path / "config.ini"),
+            ENV_MODE: "offline",
+        }
+        run_cli("create-table", "pm", env_overrides=env)
+
+        out, _ = run_cli("status", env_overrides=env)
+        assert "local only" in out
+
+        out, _ = run_cli("push", env_overrides=env)
+        assert "Pushed 3 branch(es)" in out
+
+        out, _ = run_cli("status", env_overrides=env)
+        assert "In sync" in out
+
+    def test_pull_and_sync_smoke(self, clone, tmp_path):
+        env = {ENV_REPO: str(clone), ENV_CONFIG: str(tmp_path / "config.ini")}
+        out, _ = run_cli("pull", env_overrides=env)
+        assert "Already up to date" in out
+        out, _ = run_cli("sync", env_overrides=env)
+        assert "Already up to date" in out and "Nothing to push" in out
+
+    def test_diverged_exits_4(self, make_clone, tmp_path):
+        # A (online) and B (offline) both advance the same log branch.
+        clone_a, clone_b = make_clone("cli_div_a"), make_clone("cli_div_b")
+        env_a = {ENV_REPO: str(clone_a), ENV_CONFIG: str(tmp_path / "ca.ini")}
+        env_b = {
+            ENV_REPO: str(clone_b),
+            ENV_CONFIG: str(tmp_path / "cb.ini"),
+            ENV_MODE: "offline",
+        }
+        run_cli("create-table", "pm", env_overrides=env_a)
+        run_cli("set", "-t", "pm", "seed", "s", env_overrides=env_a)
+        run_cli("pull", env_overrides=env_b)
+        run_cli("set", "-t", "pm", "k", "from-a", env_overrides=env_a)
+        run_cli("set", "-t", "pm", "k", "from-b", env_overrides=env_b)
+
+        _, err = run_cli("pull", env_overrides=env_b, expect_exit=4)
+        assert "diverged" in err

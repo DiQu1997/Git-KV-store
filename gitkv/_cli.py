@@ -17,14 +17,17 @@ import sys
 from gitkv import (
     GitKVError,
     GitKVStore,
+    SyncDivergedError,
     TableAlreadyExistsError,
     TableNotFoundError,
 )
 from gitkv._config import (
     ALLOWED_KEYS,
+    VALID_MODES,
     Config,
     config_path,
     describe_sources,
+    resolve_mode,
     resolve_repo,
     resolve_rotation_threshold,
     resolve_table,
@@ -42,6 +45,16 @@ def _add_repo_flag(p):
         type=int,
         default=None,
         help="Commit-count threshold for auto-rotation",
+    )
+    p.add_argument(
+        "--mode",
+        choices=list(VALID_MODES),
+        default=None,
+        help=(
+            "online: every op syncs with the remote (default). "
+            "offline: ops are local-only; use pull/push/sync to exchange "
+            "with the remote"
+        ),
     )
 
 
@@ -82,6 +95,16 @@ def build_parser():
 
     p_list = sub.add_parser("list-tables", help="List known tables")
     _add_repo_flag(p_list)
+
+    # Sync commands (always talk to the remote, whatever the mode) ---------
+    for name, help_text in [
+        ("pull", "Fetch the remote and fast-forward local branches"),
+        ("push", "Publish locally-ahead branches to the remote"),
+        ("sync", "pull then push"),
+        ("status", "Show per-branch ahead/behind state vs the remote"),
+    ]:
+        p = sub.add_parser(name, help=help_text)
+        _add_repo_flag(p)
 
     # Config command ------------------------------------------------------
     p_config = sub.add_parser("config", help="Manage user defaults")
@@ -149,6 +172,61 @@ def _handle_data_command(args, cfg, store):
         print(f"Rotated. New active log: {new_branch}")
 
 
+def _print_pull_summary(result):
+    if result["created"]:
+        print(f"Created {len(result['created'])} local branch(es): "
+              f"{', '.join(result['created'])}")
+    if result["updated"]:
+        print(f"Fast-forwarded {len(result['updated'])} branch(es): "
+              f"{', '.join(result['updated'])}")
+    if not result["created"] and not result["updated"]:
+        print("Already up to date.")
+    if result["ahead"] or result["local_only"]:
+        pending = list(result["ahead"]) + result["local_only"]
+        print(f"Local work not yet pushed on: {', '.join(pending)} "
+              f"(run `gitkv push`)")
+
+
+def _print_push_summary(result):
+    if result["pushed"]:
+        print(f"Pushed {len(result['pushed'])} branch(es): "
+              f"{', '.join(result['pushed'])}")
+    else:
+        print("Nothing to push.")
+
+
+def _handle_sync_command(args, store):
+    if args.cmd == "pull":
+        _print_pull_summary(store.pull())
+        return
+    if args.cmd == "push":
+        _print_push_summary(store.push())
+        return
+    if args.cmd == "sync":
+        result = store.sync()
+        _print_pull_summary(result["pull"])
+        _print_push_summary(result["push"])
+        return
+    if args.cmd == "status":
+        st = store.status()
+        lines = []
+        for branch, n in st["ahead"].items():
+            lines.append(f"{branch}: ahead {n}")
+        for branch, n in st["behind"].items():
+            lines.append(f"{branch}: behind {n}")
+        for branch in st["diverged"]:
+            lines.append(f"{branch}: DIVERGED — reconcile manually")
+        for branch in st["local_only"]:
+            lines.append(f"{branch}: local only (will push)")
+        for branch in st["remote_only"]:
+            lines.append(f"{branch}: remote only (will pull)")
+        if lines:
+            print("\n".join(sorted(lines)))
+        else:
+            print("In sync with remote.")
+        return
+
+
 def _handle_config_command(args):
     if args.config_cmd == "path":
         print(config_path())
@@ -198,12 +276,21 @@ def main():
         rotation_threshold = resolve_rotation_threshold(
             getattr(args, "rotation_threshold", None), cfg
         )
-        store = GitKVStore(repo, rotation_threshold=rotation_threshold)
-    except GitKVError as e:
+        mode = resolve_mode(getattr(args, "mode", None), cfg)
+        store = GitKVStore(
+            repo,
+            rotation_threshold=rotation_threshold,
+            offline=(mode == "offline"),
+        )
+    except (GitKVError, ValueError) as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
     try:
+        if args.cmd in ("pull", "push", "sync", "status"):
+            _handle_sync_command(args, store)
+            return
+
         if args.cmd == "list-tables":
             for prefix in store.list_tables():
                 print(prefix)
@@ -221,6 +308,9 @@ def main():
     except TableAlreadyExistsError as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(3)
+    except SyncDivergedError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(4)
     except GitKVError as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
