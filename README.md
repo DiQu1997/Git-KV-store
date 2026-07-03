@@ -94,6 +94,35 @@ store.table("pm").set("user/alice", "alice@example.com")
 store.table("pm").get("missing")          # → None (does not raise)
 ```
 
+## Offline mode
+
+By default every op syncs with the remote (fetch before read, push after
+write) so multiple clients stay consistent. If you're the only writer — or
+you're on a plane — offline mode keeps every op local and you sync when you
+choose:
+
+```bash
+gitkv config set mode offline    # or: --mode offline / GITKV_MODE=offline
+
+gitkv set foo bar                # instant, no network
+gitkv status                     # per-branch ahead/behind vs the remote
+gitkv push                       # publish local work
+gitkv pull                       # fast-forward local branches
+gitkv sync                       # pull then push
+```
+
+```python
+db = gitkv.open(offline=True)
+db["pm"]["k"] = "v"              # local commit only
+db.sync()                        # exchange with the remote
+```
+
+gitkv never auto-merges. If a branch moved both locally and on the remote,
+`pull`/`push` refuse with `SyncDivergedError` (CLI exit code 4) and leave
+everything untouched — reconcile with plain git, then retry. Offline mode is
+therefore effectively **single-writer**; concurrent writers should stay in
+online mode, where Git's fast-forward push gives compare-and-swap safety.
+
 ## How the data is laid out
 
 Each key becomes a Git blob at a path matching the key. `user/alice/email`

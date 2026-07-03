@@ -30,6 +30,7 @@ from datetime import datetime, timezone
 
 DEFAULT_ROTATION_THRESHOLD = 10000
 DEFAULT_MAX_CAS_ATTEMPTS = 20
+ZERO_SHA = "0" * 40
 
 
 def _backoff_sleep(attempt):
@@ -62,6 +63,13 @@ class ChainBrokenError(GitKVError):
 
 class CycleDetectedError(GitKVError):
     pass
+
+
+class SyncDivergedError(GitKVError):
+    """Local and remote histories have both moved on the same branch.
+
+    gitkv never auto-merges: reconcile manually with git (e.g. rebase the
+    local branch onto the remote one), then retry pull()/push()."""
 
 
 # ---------------------------------------------------------------------------
@@ -187,11 +195,19 @@ class GitKVStore:
         remote_name="origin",
         rotation_threshold=DEFAULT_ROTATION_THRESHOLD,
         max_cas_attempts=DEFAULT_MAX_CAS_ATTEMPTS,
+        offline=False,
     ):
         self.repo_path = repo_path
         self.remote_name = remote_name
         self.rotation_threshold = rotation_threshold
         self.max_cas_attempts = max_cas_attempts
+        # Offline mode: every op reads and writes local branch heads
+        # (refs/heads/*) and never touches the network. Local heads are
+        # bootstrapped from remote-tracking refs on first use. Publish /
+        # refresh happens only through explicit pull()/push()/sync().
+        # Offline is effectively single-writer: concurrent remote writes
+        # surface as SyncDivergedError at sync time, never auto-merged.
+        self.offline = offline
 
         rc, out, err = _run_git(repo_path, ["rev-parse", "--git-dir"], check=False)
         if rc != 0:
@@ -242,17 +258,62 @@ class GitKVStore:
                 f.close()
 
     # ----- ref / fetch helpers -----
+    #
+    # Every data op reads a branch tip and (for writes) CAS-updates it.
+    # Online, "read" means fetch from the remote into a remote-tracking ref
+    # and "update" means git push (the server's fast-forward check is the
+    # CAS). Offline, "read" means the local head (bootstrapped once from the
+    # remote-tracking ref) and "update" means `git update-ref` with an
+    # expected old value (the local CAS). All call sites go through
+    # `_branch_ref` / `_refresh_*` / `_cas_update_branch` so they never need
+    # to know which mode they're in.
 
     def _rev_parse(self, rev):
         return self._git("rev-parse", rev).strip()
+
+    def _local_ref_exists(self, ref):
+        rc, _, _ = self._git_safe("rev-parse", "--verify", "--quiet", ref)
+        return rc == 0
+
+    def _ensure_local_head(self, branch):
+        """Bootstrap refs/heads/<branch> from the remote-tracking ref if it
+        doesn't exist yet. Returns True if the head exists afterwards."""
+        head = f"refs/heads/{branch}"
+        if self._local_ref_exists(head):
+            return True
+        remote = f"refs/remotes/{self.remote_name}/{branch}"
+        if self._local_ref_exists(remote):
+            self._git("update-ref", head, self._rev_parse(remote))
+            return True
+        return False
+
+    def _branch_ref(self, branch):
+        """The ref data ops read a branch tip from, per mode."""
+        if self.offline:
+            return f"refs/heads/{branch}"
+        return self._remote_ref(branch)
 
     def _ref_exists_remote(self, ref):
         rc, out, _ = self._git_safe("ls-remote", "--exit-code", self.remote_name, ref)
         return rc == 0 and bool(out.strip())
 
+    def _table_ref_exists(self, branch):
+        """Mode-aware existence check for a table's branch."""
+        if self.offline:
+            return self._ensure_local_head(branch)
+        return self._ref_exists_remote(f"refs/heads/{branch}")
+
     def _fetch_with_filter(self, branch, filter_spec):
-        """Fetch the tip commit of `branch` with the given filter. Falls back
-        to plain --depth=1 (no filter) if the remote refuses partial clone."""
+        """Refresh our view of `branch`'s tip. Online: fetch with the given
+        partial-clone filter (fall back to plain --depth=1 if the remote
+        refuses filters). Offline: no network — just make sure the local
+        head exists."""
+        if self.offline:
+            if not self._ensure_local_head(branch):
+                raise GitKVError(
+                    f"Branch {branch!r} not available locally; run pull() first"
+                )
+            return
         rc, _, err = self._git_safe(
             "fetch", f"--filter={filter_spec}", "--depth=1",
             self.remote_name, branch,
@@ -276,10 +337,58 @@ class GitKVStore:
         self._fetch_with_filter(branch, "blob:none")
 
     def _fetch_full(self, branch):
+        if self.offline:
+            if not self._ensure_local_head(branch):
+                raise GitKVError(
+                    f"Branch {branch!r} not available locally; run pull() first"
+                )
+            return
         self._git("fetch", self.remote_name, branch)
 
     def _remote_ref(self, branch):
         return f"refs/remotes/{self.remote_name}/{branch}"
+
+    # ----- ref publication (mode-aware CAS) -----
+
+    def _cas_update_branch(self, branch, new_sha, old_sha=None):
+        """Move `branch` to `new_sha`, failing if someone else moved it first.
+
+        old_sha None means "create: the branch must not exist yet".
+        Online, the CAS is the server's fast-forward check (new_sha's parent
+        chain must contain the remote tip). Offline, it's update-ref's
+        expected-old-value check against `old_sha`.
+
+        Returns (rc, stderr_text); a CAS loss satisfies `_is_non_ff`.
+        """
+        if self.offline:
+            rc, _, err = self._git_safe(
+                "update-ref", f"refs/heads/{branch}", new_sha, old_sha or ZERO_SHA
+            )
+            return rc, err
+        rc, _, err = self._git_safe(
+            "push", self.remote_name, f"{new_sha}:refs/heads/{branch}"
+        )
+        return rc, err
+
+    def _publish_new_refs(self, pairs):
+        """Atomically create several new branches. `pairs` is [(sha, branch)].
+        Returns (rc, stderr_text)."""
+        if self.offline:
+            script = "".join(f"create refs/heads/{b} {sha}\n" for sha, b in pairs)
+            rc, _, err = self._git_safe(
+                "update-ref", "--stdin", input_bytes=script.encode()
+            )
+            return rc, err
+        refspecs = [f"{sha}:refs/heads/{b}" for sha, b in pairs]
+        rc, _, err = self._git_safe("push", "--atomic", self.remote_name, *refspecs)
+        return rc, err
+
+    def _delete_branch(self, branch):
+        """Best-effort deletion of a branch we just created (rotate cleanup)."""
+        if self.offline:
+            self._git_safe("update-ref", "-d", f"refs/heads/{branch}")
+        else:
+            self._git_safe("push", self.remote_name, f":refs/heads/{branch}")
 
     def _commit_message(self, sha):
         rc, out, err = self._git_safe("cat-file", "-p", sha)
@@ -451,11 +560,15 @@ class GitKVStore:
     # ----- registry (top-level `main` branch) -----
 
     def list_tables(self):
-        rc, _, _ = self._git_safe("fetch", self.remote_name, "main")
-        if rc != 0:
-            return []
+        if self.offline:
+            if not self._ensure_local_head("main"):
+                return []
+        else:
+            rc, _, _ = self._git_safe("fetch", self.remote_name, "main")
+            if rc != 0:
+                return []
         try:
-            tip = self._rev_parse(self._remote_ref("main"))
+            tip = self._rev_parse(self._branch_ref("main"))
             tree = self._rev_parse(f"{tip}^{{tree}}")
         except GitKVError:
             return []
@@ -473,7 +586,7 @@ class GitKVStore:
 
     def create_table(self, prefix):
         _validate_prefix(prefix)
-        if self._ref_exists_remote(f"refs/heads/{prefix}_main"):
+        if self._table_ref_exists(f"{prefix}_main"):
             raise TableAlreadyExistsError(f"Table {prefix!r} already exists")
 
         first_log = f"{prefix}_log_{uuid.uuid4().hex[:16]}"
@@ -493,11 +606,10 @@ class GitKVStore:
             f"Open log segment for {prefix}\n\nCommit-Number: 1\n",
         )
 
-        rc, _, err = self._git_safe(
-            "push", "--atomic", self.remote_name,
-            f"{genesis_sha}:refs/heads/{prefix}_main",
-            f"{first_log_sha}:refs/heads/{first_log}",
-        )
+        rc, err = self._publish_new_refs([
+            (genesis_sha, f"{prefix}_main"),
+            (first_log_sha, first_log),
+        ])
         if rc != 0:
             raise GitKVError(
                 f"Failed to publish genesis refs for table {prefix!r}: {err.strip()}"
@@ -509,9 +621,16 @@ class GitKVStore:
     def _register_table_in_main(self, prefix):
         empty_blob = self._hash_object(b"")
         for attempt in range(5):
-            rc, _, _ = self._git_safe("fetch", self.remote_name, "main")
-            if rc == 0:
-                base_sha = self._rev_parse(self._remote_ref("main"))
+            base_sha = None
+            if self.offline:
+                if self._ensure_local_head("main"):
+                    base_sha = self._rev_parse("refs/heads/main")
+            else:
+                rc, _, _ = self._git_safe("fetch", self.remote_name, "main")
+                if rc == 0:
+                    base_sha = self._rev_parse(self._remote_ref("main"))
+
+            if base_sha:
                 base_tree = self._rev_parse(f"{base_sha}^{{tree}}")
                 parents = [base_sha]
             else:
@@ -525,9 +644,7 @@ class GitKVStore:
                 return
 
             commit = self._commit_tree(new_tree, parents, f"Register table: {prefix}")
-            rc, _, err = self._git_safe(
-                "push", self.remote_name, f"{commit}:refs/heads/main"
-            )
+            rc, err = self._cas_update_branch("main", commit, old_sha=base_sha)
             if rc == 0:
                 return
             if _is_non_ff(err):
@@ -539,6 +656,164 @@ class GitKVStore:
     def table(self, prefix):
         _validate_prefix(prefix)
         return GitKVTable(self, prefix)
+
+    # ----- explicit sync (pull / push / status) -----
+    #
+    # These always talk to the network, regardless of mode. They are the only
+    # way offline work reaches the remote (and vice versa). Divergence — both
+    # sides moved on the same branch — is never auto-merged: pull() and
+    # push() raise SyncDivergedError and leave refs untouched, and the user
+    # reconciles with plain git.
+
+    def _list_branch_names(self, ref_prefix):
+        rc, out, _ = self._git_safe(
+            "for-each-ref", "--format=%(refname)", ref_prefix
+        )
+        if rc != 0:
+            return set()
+        names = set()
+        for line in out.decode().splitlines():
+            if not line:
+                continue
+            name = line[len(ref_prefix):].lstrip("/")
+            if name and name != "HEAD":
+                names.add(name)
+        return names
+
+    def _fetch_all(self):
+        """Update every remote-tracking ref. Unshallows first if some online
+        op left the repo shallow — sync needs real ancestry to reason about."""
+        shallow = self._git("rev-parse", "--is-shallow-repository").strip()
+        args = ["fetch"]
+        if shallow == "true":
+            args.append("--unshallow")
+        args += [self.remote_name,
+                 f"+refs/heads/*:refs/remotes/{self.remote_name}/*"]
+        self._git(*args)
+
+    def status(self, fetch=True):
+        """Compare local heads against the remote, per branch.
+
+        Returns a dict:
+          ahead       {branch: n}  local has n commits the remote lacks
+          behind      {branch: n}  remote has n commits local lacks
+          diverged    [branch]     both sides moved — needs manual reconcile
+          local_only  [branch]     branch exists only locally (will push)
+          remote_only [branch]     branch exists only on the remote (will pull)
+
+        All five empty means fully in sync.
+        """
+        if fetch:
+            self._fetch_all()
+        result = {
+            "ahead": {}, "behind": {},
+            "diverged": [], "local_only": [], "remote_only": [],
+        }
+        local = self._list_branch_names("refs/heads")
+        remote = self._list_branch_names(f"refs/remotes/{self.remote_name}")
+        for branch in sorted(local | remote):
+            if branch not in remote:
+                result["local_only"].append(branch)
+                continue
+            if branch not in local:
+                result["remote_only"].append(branch)
+                continue
+            local_sha = self._rev_parse(f"refs/heads/{branch}")
+            remote_sha = self._rev_parse(self._remote_ref(branch))
+            if local_sha == remote_sha:
+                continue
+            rc, out, _ = self._git_safe(
+                "rev-list", "--left-right", "--count",
+                f"refs/heads/{branch}...{self._remote_ref(branch)}",
+            )
+            if rc != 0:
+                # Can't establish ancestry (e.g. shallow gaps) — treat as
+                # diverged so we refuse rather than guess.
+                result["diverged"].append(branch)
+                continue
+            ahead, behind = (int(x) for x in out.decode().split())
+            if ahead and behind:
+                result["diverged"].append(branch)
+            elif ahead:
+                result["ahead"][branch] = ahead
+            elif behind:
+                result["behind"][branch] = behind
+        return result
+
+    def pull(self):
+        """Fetch the remote and fast-forward local heads.
+
+        Creates local heads for remote-only branches, fast-forwards heads the
+        remote is ahead of, and leaves locally-ahead branches alone (push()
+        publishes those). Raises SyncDivergedError — without touching any
+        local head — if any branch has moved on both sides.
+        """
+        st = self.status(fetch=True)
+        if st["diverged"]:
+            raise SyncDivergedError(
+                f"Cannot pull: local and remote histories diverged on: "
+                f"{', '.join(st['diverged'])}. Reconcile manually with git "
+                f"(e.g. rebase refs/heads/<branch> onto the remote), then retry."
+            )
+        updated, created = [], []
+        for branch in st["behind"]:
+            self._git(
+                "update-ref", f"refs/heads/{branch}",
+                self._rev_parse(self._remote_ref(branch)),
+            )
+            updated.append(branch)
+        for branch in st["remote_only"]:
+            self._git(
+                "update-ref", f"refs/heads/{branch}",
+                self._rev_parse(self._remote_ref(branch)),
+            )
+            created.append(branch)
+        # Tips moved under the cached values.
+        self._active_cache.clear()
+        return {
+            "created": created,
+            "updated": updated,
+            "ahead": dict(st["ahead"]),
+            "local_only": list(st["local_only"]),
+        }
+
+    def push(self):
+        """Publish locally-ahead branches to the remote.
+
+        Pushes every branch where local is strictly ahead (or exists only
+        locally). Never forces: if the remote moved since the last fetch the
+        push is rejected and SyncDivergedError is raised — run pull() and
+        retry. Branches where only the remote moved are left for pull().
+        """
+        st = self.status(fetch=True)
+        if st["diverged"]:
+            raise SyncDivergedError(
+                f"Cannot push: local and remote histories diverged on: "
+                f"{', '.join(st['diverged'])}. Reconcile manually with git, "
+                f"then retry."
+            )
+        branches = list(st["ahead"]) + st["local_only"]
+        if not branches:
+            return {"pushed": []}
+        refspecs = [f"refs/heads/{b}:refs/heads/{b}" for b in branches]
+        rc, _, err = self._git_safe(
+            "push", "--atomic", self.remote_name, *refspecs
+        )
+        if rc != 0:
+            if _is_non_ff(err):
+                raise SyncDivergedError(
+                    f"Push rejected — the remote moved since the last fetch: "
+                    f"{err.strip()}. Run pull() and retry."
+                )
+            raise GitKVError(f"Push failed: {err.strip()}")
+        return {"pushed": branches}
+
+    def sync(self):
+        """pull() then push(). The everyday 'flush my offline work up and
+        grab anything new' operation."""
+        pulled = self.pull()
+        pushed = self.push()
+        return {"pull": pulled, "push": pushed}
 
     # ----- dict-style ergonomics -----
     #
@@ -582,14 +857,21 @@ class GitKVTable:
 
     def _genesis_sha(self):
         branch = self._genesis_branch()
-        rc, _, err = self.store._git_safe(
-            "fetch", "--depth=1", self.store.remote_name, branch
-        )
-        if rc != 0:
-            raise TableNotFoundError(
-                f"Table {self.prefix!r} does not exist: {err.strip()}"
+        if self.store.offline:
+            if not self.store._ensure_local_head(branch):
+                raise TableNotFoundError(
+                    f"Table {self.prefix!r} does not exist locally; "
+                    f"run pull() if it lives on the remote"
+                )
+        else:
+            rc, _, err = self.store._git_safe(
+                "fetch", "--depth=1", self.store.remote_name, branch
             )
-        return self.store._rev_parse(self.store._remote_ref(branch))
+            if rc != 0:
+                raise TableNotFoundError(
+                    f"Table {self.prefix!r} does not exist: {err.strip()}"
+                )
+        return self.store._rev_parse(self.store._branch_ref(branch))
 
     def _genesis_first_log(self):
         sha = self._genesis_sha()
@@ -623,7 +905,7 @@ class GitKVTable:
             visited.add(current)
 
             self.store._fetch_tip_only(current)
-            tip = self.store._rev_parse(self.store._remote_ref(current))
+            tip = self.store._rev_parse(self.store._branch_ref(current))
             msg = self.store._commit_message(tip)
 
             next_ref = _parse_trailer(msg, "Tombstone-Next-Branch")
@@ -640,7 +922,7 @@ class GitKVTable:
         with self.store._lock(self.prefix):
             active, _ = self._find_active()
             self.store._fetch_full(active)
-            tip = self.store._rev_parse(self.store._remote_ref(active))
+            tip = self.store._rev_parse(self.store._branch_ref(active))
             tree = self.store._rev_parse(f"{tip}^{{tree}}")
             rc, out, _ = self.store._git_safe(
                 "cat-file", "-p", f"{tree}:{'/'.join(parts)}"
@@ -689,10 +971,7 @@ class GitKVTable:
 
             full_msg = f"{msg}\n\nCommit-Number: {parent_number + 1}\n"
             new_commit = self.store._commit_tree(new_tree, [tip], full_msg)
-            rc, _, err = self.store._git_safe(
-                "push", self.store.remote_name,
-                f"{new_commit}:refs/heads/{active}",
-            )
+            rc, err = self.store._cas_update_branch(active, new_commit, old_sha=tip)
             if rc == 0:
                 self.store._active_cache[self.prefix] = (active, new_commit)
                 return
@@ -740,9 +1019,8 @@ class GitKVTable:
             )
             new_first = self.store._commit_tree(tree, [genesis], new_first_msg)
 
-            rc, _, err = self.store._git_safe(
-                "push", self.store.remote_name,
-                f"{new_first}:refs/heads/{new_branch}",
+            rc, err = self.store._cas_update_branch(
+                new_branch, new_first, old_sha=None
             )
             if rc != 0:
                 # UUID collision is statistically impossible; treat as fatal.
@@ -763,9 +1041,8 @@ class GitKVTable:
             )
             tombstone_sha = self.store._commit_tree(tree, [tip], tombstone_msg)
 
-            rc, _, err = self.store._git_safe(
-                "push", self.store.remote_name,
-                f"{tombstone_sha}:refs/heads/{active}",
+            rc, err = self.store._cas_update_branch(
+                active, tombstone_sha, old_sha=tip
             )
             if rc == 0:
                 self.store._active_cache[self.prefix] = (new_branch, new_first)
@@ -774,9 +1051,7 @@ class GitKVTable:
             if _is_non_ff(err):
                 # Someone else moved <active>. Our new_branch is now orphan.
                 # Delete it and retry from scratch with a fresh UUID.
-                self.store._git_safe(
-                    "push", self.store.remote_name, f":refs/heads/{new_branch}"
-                )
+                self.store._delete_branch(new_branch)
                 last_err = err.strip()
                 self.store._active_cache.pop(self.prefix, None)
                 _backoff_sleep(attempt)
@@ -829,7 +1104,7 @@ class GitKVTable:
         with self.store._lock(self.prefix):
             active, _ = self._find_active()
             self.store._fetch_tree_only(active)
-            tip = self.store._rev_parse(self.store._remote_ref(active))
+            tip = self.store._rev_parse(self.store._branch_ref(active))
             keys = self._collect_keys_under(tip, normalized)
         return _apply_pagination(keys, after, limit)
 
@@ -843,7 +1118,7 @@ class GitKVTable:
         with self.store._lock(self.prefix):
             active, _ = self._find_active()
             self.store._fetch_full(active)
-            tip = self.store._rev_parse(self.store._remote_ref(active))
+            tip = self.store._rev_parse(self.store._branch_ref(active))
             keys = self._collect_keys_under(tip, normalized)
             page = _apply_pagination(keys, after, limit)
             return [(k, self._cat_blob(tip, k)) for k in page]

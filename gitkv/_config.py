@@ -25,10 +25,13 @@ CONFIG_SECTION = "gitkv"
 ENV_REPO = "GITKV_REPO"
 ENV_TABLE = "GITKV_TABLE"
 ENV_ROTATION_THRESHOLD = "GITKV_ROTATION_THRESHOLD"
+ENV_MODE = "GITKV_MODE"
 ENV_CONFIG = "GITKV_CONFIG"
 
 # The keys allowed in the config file / `gitkv config` subcommand.
-ALLOWED_KEYS = frozenset({"repo", "table", "rotation_threshold"})
+ALLOWED_KEYS = frozenset({"repo", "table", "rotation_threshold", "mode"})
+
+VALID_MODES = ("online", "offline")
 
 
 def _xdg_config_home() -> Path:
@@ -49,6 +52,7 @@ class Config:
     repo: Optional[str] = None
     table: Optional[str] = None
     rotation_threshold: Optional[int] = None
+    mode: Optional[str] = None
 
     @classmethod
     def from_file(cls, path: Optional[Path] = None) -> "Config":
@@ -65,6 +69,7 @@ class Config:
         cfg.table = section.get("table") or None
         rt = section.get("rotation_threshold")
         cfg.rotation_threshold = int(rt) if rt else None
+        cfg.mode = section.get("mode") or None
         return cfg
 
 
@@ -84,6 +89,10 @@ def write_config(updates: dict, path: Optional[Path] = None) -> Path:
         if key not in ALLOWED_KEYS:
             raise ValueError(
                 f"Unknown config key {key!r}. Allowed: {sorted(ALLOWED_KEYS)}"
+            )
+        if key == "mode" and value is not None and value not in VALID_MODES:
+            raise ValueError(
+                f"Invalid mode {value!r}. Must be one of: {', '.join(VALID_MODES)}"
             )
         if value is None:
             section.pop(key, None)
@@ -122,6 +131,16 @@ def resolve_rotation_threshold(cli_value: Optional[int], cfg: Config) -> int:
     return DEFAULT_ROTATION_THRESHOLD
 
 
+def resolve_mode(cli_value: Optional[str], cfg: Config) -> str:
+    """Resolve online/offline mode from CLI > env > config > default(online)."""
+    raw = cli_value or os.environ.get(ENV_MODE) or cfg.mode or "online"
+    if raw not in VALID_MODES:
+        raise ValueError(
+            f"Invalid mode {raw!r}. Must be one of: {', '.join(VALID_MODES)}"
+        )
+    return raw
+
+
 def describe_sources(cfg: Config) -> list:
     """Return [(key, value, source)] for every effective setting, even the
     unset ones. Used by `gitkv config list`."""
@@ -131,6 +150,7 @@ def describe_sources(cfg: Config) -> list:
         ("table", ENV_TABLE, lambda: resolve_table(None, cfg)),
         ("rotation_threshold", ENV_ROTATION_THRESHOLD,
          lambda: resolve_rotation_threshold(None, cfg)),
+        ("mode", ENV_MODE, lambda: resolve_mode(None, cfg)),
     ]:
         value = resolver()
         if os.environ.get(env_var):

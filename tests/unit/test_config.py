@@ -160,3 +160,40 @@ class TestDescribeSources:
         rows = {k: (v, src) for k, v, src in describe_sources(Config.from_file())}
         assert rows["repo"][1] == "config"
         assert rows["table"][1] == f"env:{ENV_TABLE}"
+
+
+class TestResolveMode:
+    def test_default_online(self, isolated_config):
+        from gitkv._config import resolve_mode
+        assert resolve_mode(None, Config.from_file()) == "online"
+
+    def test_config_file_value(self, isolated_config):
+        from gitkv._config import resolve_mode
+        write_config({"mode": "offline"})
+        assert resolve_mode(None, Config.from_file()) == "offline"
+
+    def test_env_overrides_config(self, isolated_config, monkeypatch):
+        from gitkv._config import ENV_MODE, resolve_mode
+        write_config({"mode": "offline"})
+        monkeypatch.setenv(ENV_MODE, "online")
+        assert resolve_mode(None, Config.from_file()) == "online"
+
+    def test_cli_overrides_everything(self, isolated_config, monkeypatch):
+        from gitkv._config import ENV_MODE, resolve_mode
+        write_config({"mode": "online"})
+        monkeypatch.setenv(ENV_MODE, "online")
+        assert resolve_mode("offline", Config.from_file()) == "offline"
+
+    def test_invalid_env_value_raises(self, isolated_config, monkeypatch):
+        from gitkv._config import ENV_MODE, resolve_mode
+        monkeypatch.setenv(ENV_MODE, "turbo")
+        with pytest.raises(ValueError, match="Invalid mode"):
+            resolve_mode(None, Config.from_file())
+
+    def test_write_config_rejects_invalid_mode(self, isolated_config):
+        with pytest.raises(ValueError, match="Invalid mode"):
+            write_config({"mode": "sometimes"})
+
+    def test_mode_in_describe_sources(self, isolated_config):
+        rows = {k: (v, src) for k, v, src in describe_sources(Config.from_file())}
+        assert rows["mode"] == ("online", "default")

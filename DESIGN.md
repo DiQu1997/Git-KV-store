@@ -289,6 +289,25 @@ refs/heads/pm_log_<uuid_1>
 analytics_main, analytics_log_<...>, ... : same structure, independent chain
 ```
 
+## Execution modes: online vs offline
+
+Every data op boils down to "read a branch tip, then CAS-update it". The two
+modes differ only in where that tip lives and what the CAS is:
+
+| | online (default) | offline |
+|---|---|---|
+| tip read from | `refs/remotes/origin/<b>` after a filtered fetch | `refs/heads/<b>` (no network) |
+| CAS mechanism | server-side fast-forward check on `git push` | `git update-ref <ref> <new> <expected-old>` |
+| first contact with a branch | fetch | bootstrap local head from the remote-tracking ref |
+| consistency | multi-writer safe | single-writer; divergence surfaces at sync |
+
+Offline work reaches the remote only through explicit `pull()` / `push()` /
+`sync()`. Sync is fast-forward-only in both directions: a branch that moved
+on both sides raises `SyncDivergedError` and nothing is touched — the user
+reconciles with plain git. There is deliberately no auto-merge: a "merge" of
+two KV write logs has no single right answer (rotations, same-key writes),
+and a wrong guess silently loses data.
+
 ## Implementation plan
 
 The design is delivered in two stages so each lands as an independently working artifact.
