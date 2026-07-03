@@ -30,8 +30,10 @@ gitkv create-table pm
 gitkv set user/alice "alice@example.com"
 gitkv get user/alice
 # alice@example.com
+gitkv delete user/alice
 gitkv list-tables
 # pm
+gitkv rotate                             # manually close the current log segment
 ```
 
 You can also override the defaults per command:
@@ -44,6 +46,12 @@ GITKV_REPO=/elsewhere gitkv list-tables  # via env var
 
 See `gitkv config --help` (`config set`/`get`/`list`/`unset`/`path`) and
 `gitkv config list` to see which value comes from which source.
+
+Config keys: `repo`, `table`, `mode` (`online`/`offline`), and
+`rotation_threshold` (commits per log segment before auto-rotation,
+default 10000). Each has a matching env var: `GITKV_REPO`, `GITKV_TABLE`,
+`GITKV_MODE`, `GITKV_ROTATION_THRESHOLD`. Resolution is always
+CLI flag > env var > config file > default.
 
 As a Python library:
 
@@ -122,6 +130,19 @@ gitkv never auto-merges. If a branch moved both locally and on the remote,
 everything untouched — reconcile with plain git, then retry. Offline mode is
 therefore effectively **single-writer**; concurrent writers should stay in
 online mode, where Git's fast-forward push gives compare-and-swap safety.
+
+### Choosing a mode
+
+| Scenario | Mode |
+|---|---|
+| Multiple machines / writers sharing state | online (default) |
+| Personal store, one machine at a time | offline + occasional `sync` |
+| Bulk-loading many keys, publish once | offline, then one `push` |
+| No network (plane, air-gapped) | offline |
+
+Online costs one or more network round-trips per operation; offline
+operations are local commits (roughly 3x faster even against a same-disk
+remote, far more over a real network).
 
 ## How the data is laid out
 
